@@ -1,0 +1,124 @@
+- name: Установка RabbitMQ на несколько нод в кластере с политикой ha-all
+  hosts: webservers
+  become: true  # <-- Включает выполнение через sudo
+
+  vars:
+    rabbit_user: test
+    rabbit_pass: "test"
+    master_node: "server1"
+    erlang_cookie: "TODRXNKWPVIRMUDJNQPJ"
+  
+  tasks:
+    - name: 1. Установка hostname на каждом сервере
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: 2. Прописывание всех нод в /etc/hosts для резолвинга по именам
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item]['ansible_host'] }} {{ item }}"
+        state: present
+      loop: "{{ groups['webservers'] }}"
+
+    - name: 3. Обновление пакетов
+      apt:
+        update_cache: yes
+
+    - name: 4. Установка Erlang и зависимостей
+      apt:
+        name:
+          - erlang-base
+          - erlang-asn1
+          - erlang-crypto
+          - erlang-eldap
+          - erlang-ftp
+          - erlang-inets
+          - erlang-mnesia
+          - erlang-os-mon
+          - erlang-parsetools
+          - erlang-public-key
+          - erlang-runtime-tools
+          - erlang-snmp
+          - erlang-ssl
+          - erlang-syntax-tools
+          - erlang-tftp
+          - erlang-tools
+          - erlang-xmerl
+        state: present
+
+    - name: 5. Скачивание и установка RabbitMQ 3.10.7
+      apt:
+        deb: https://github.com/rabbitmq/rabbitmq-server/releases/download/v3.10.7/rabbitmq-server_3.10.7-1_all.deb
+        state: present
+   
+    - name: 6. Остановка RabbitMQ перед заменой cookie
+      service:
+        name: rabbitmq-server
+        state: stopped
+
+    - name: 7. Запись единого .erlang.cookie на обе ноды
+      copy:
+        content: "{{ erlang_cookie }}"
+        dest: /var/lib/rabbitmq/.erlang.cookie
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0400'
+
+    - name: 8. Запуск службы RabbitMQ
+      service:
+        name: rabbitmq-server
+        state: started
+        enabled: yes  
+        
+    - name: 9. Включение плагина
+      command: rabbitmq-plugins enable rabbitmq_management
+      register: cmd_result
+      changed_when: false
+
+    - name: 10. Вывод результата
+      ansible.builtin.debug:
+        var: cmd_result.stdout_lines
+
+    - name: 11. Проверка текущего статуса кластера на второй ноде
+      command: rabbitmqctl cluster_status
+      register: cluster_status
+      changed_when: false
+      when: inventory_hostname != master_node
+
+    - name: 12. Присоединение второй ноды к главной ноде
+      shell: |
+        rabbitmqctl stop_app
+        rabbitmqctl reset
+        rabbitmqctl join_cluster rabbit@{{ master_node }}
+        rabbitmqctl start_app
+      when:
+        - inventory_hostname != master_node
+        - "'rabbit@' + master_node not in cluster_status.stdout"
+
+    - name: 13. Создание пользователя-администратора для веб-интерфейса
+      community.rabbitmq.rabbitmq_user:
+        user: "{{ rabbit_user }}"
+        password: "{{ rabbit_pass }}"
+        vhost: /
+        configure_priv: .*
+        read_priv: .*
+        write_priv: .*
+        tags: administrator
+        state: present
+
+    - name: 14. Настройка политики зеркалирования ha-all (на главной ноде)
+      community.rabbitmq.rabbitmq_policy:
+        name: ha-all
+        pattern: ".*"
+        vhost: /
+        tags:
+          ha-mode: all
+          ha-sync-mode: automatic
+        state: present
+      when: inventory_hostname == master_node
+    
+  handlers:
+    - name: Перезапуск RabbitMQ
+      service:
+        name: rabbitmq-server
+        state: restarted
